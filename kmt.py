@@ -3,6 +3,7 @@ import sys
 import csv
 import random
 from dataclasses import dataclass, field
+import pyproj
 
 SUMO_HOME = r"C:\Program Files (x86)\Eclipse\Sumo"
 PROJECT_DIR = r"C:\Projects\KMT"
@@ -16,7 +17,7 @@ import sumolib
 SUMO_BINARY = os.path.join(SUMO_HOME, "bin", "sumo.exe")
 SUMO_CONFIG = os.path.join(PROJECT_DIR, "simulation.sumocfg")
 NET_FILE = os.path.join(PROJECT_DIR, "map.net.xml")
-
+NET = sumolib.net.readNet(NET_FILE)
 
 @dataclass
 class Vehicle:
@@ -92,6 +93,8 @@ class Charger:
     sessions: list = field(default_factory=list)
 
     def get_available_time(self, arrival_time):
+        self.clean_finished_sessions(arrival_time)
+
         self.sessions = [
             session for session in self.sessions
             if session.finish_time > arrival_time
@@ -123,6 +126,11 @@ class Charger:
         self.sessions.append(entry)
         return entry
 
+    def clean_finished_sessions(self, current_time):
+        self.sessions = [
+            session for session in self.sessions
+            if session.finish_time > current_time
+        ]
 
 @dataclass
 class RouteInfo:
@@ -215,6 +223,15 @@ class ChargingStation:
             arrival_time=option["arrival_time"],
             required_energy=option["required_energy"]
         )
+    
+    def get_station_position(self):
+        edge = NET.getEdge(self.edge_id)
+
+        shape = edge.getShape()
+
+        x, y = shape[len(shape) // 2]
+
+        return x, y
 
 
 def select_best_station(vehicle, stations, current_time):
@@ -269,142 +286,245 @@ def create_random_stations(count=5):
 
 
 def main():
-    os.chdir(PROJECT_DIR)
+    try:
+        os.chdir(PROJECT_DIR)
 
-    #stations = create_random_stations(count=5)
-    stations = [
-        ChargingStation(
-            station_id="CS_1",
-            edge_id="97388510#1",
-            chargers=[Charger("CS_1_CH_1", power_kw=50, efficiency=0.90)]
-        ),
-        ChargingStation(
-            station_id="CS_2",
-            edge_id="-97226043#0",
-            chargers=[Charger("CS_2_CH_1", power_kw=100, efficiency=0.90)]
-        ),
-        ChargingStation(
-            station_id="CS_3",
-            edge_id="174851559#1",
-            chargers=[Charger("CS_3_CH_1", power_kw=150, efficiency=0.90)]
-        ),
-    ]
+        #stations = create_random_stations(count=5)
+        stations = [
+            ChargingStation(
+                station_id="CS_1",
+                edge_id="97388510#1",
+                chargers=[Charger("CS_1_CH_1", power_kw=50, efficiency=0.90)]
+            ),
+            ChargingStation(
+                station_id="CS_2",
+                edge_id="-97226043#0",
+                chargers=[Charger("CS_2_CH_1", power_kw=100, efficiency=0.90)]
+            ),
+            ChargingStation(
+                station_id="CS_3",
+                edge_id="174851559#1",
+                chargers=[Charger("CS_3_CH_1", power_kw=150, efficiency=0.90)]
+            ),
+        ]
 
-    print("Charging stations:")
-    for station in stations:
-        charger = station.chargers[0]
-        print(
-            station.station_id,
-            station.edge_id,
-            charger.power_kw,
-            round(charger.efficiency, 2)
-        )
+        print("Charging stations:")
+        for station in stations:
+            charger = station.chargers[0]
+            print(
+                station.station_id,
+                station.edge_id,
+                charger.power_kw,
+                round(charger.efficiency, 2)
+            )
 
-    traci.start([
-        SUMO_BINARY,
-        "-c", SUMO_CONFIG,
-        "--no-step-log", "true"
-    ])
+        traci.start([
+            SUMO_BINARY,
+            "-c", SUMO_CONFIG,
+            "--no-step-log", "true"
+        ])
 
-    vehicles = {}
-    assigned_vehicles = set()
-    records = []
+        vehicles = {}
+        vehicle_states = {}
+        records = []
 
-    while traci.simulation.getMinExpectedNumber() > 0:
-        traci.simulationStep()
+        while traci.simulation.getMinExpectedNumber() > 0:
+            traci.simulationStep()
 
-        current_time = traci.simulation.getTime() / 60
+            current_time = traci.simulation.getTime() / 60
 
-        for vehicle_id in traci.vehicle.getIDList():
-            current_edge = traci.vehicle.getRoadID(vehicle_id)
+            for vehicle_id in traci.vehicle.getIDList():
+                current_edge = traci.vehicle.getRoadID(vehicle_id)
 
-            if current_edge.startswith(":"):
-                continue
+                if current_edge.startswith(":"):
+                    continue
 
-            if vehicle_id not in vehicles:
-                vehicles[vehicle_id] = Vehicle(
-                    vehicle_id=vehicle_id,
-                    battery_capacity=35.0,
-                    current_energy=random.uniform(10.0, 22.0),
-                    consumption_per_km=0.5,
-                    current_edge=current_edge,
-                    required_energy=0.0,
-                    target_soc_percent=80.0
-                )
+                if vehicle_id not in vehicles:
+                    vehicles[vehicle_id] = Vehicle(
+                        vehicle_id=vehicle_id,
+                        battery_capacity=35.0,
+                        current_energy=random.uniform(10.0, 22.0),
+                        consumption_per_km=0.5,
+                        current_edge=current_edge,
+                        required_energy=0.0,
+                        target_soc_percent=80.0
+                    )
 
-            vehicle = vehicles[vehicle_id]
-            vehicle.current_edge = current_edge
+                    vehicle_states[vehicle_id] = {
+                        "status": "driving",
+                        "selected_station_id": None,
+                        "selected_charger_id": None,
+                        "charge_start_time": None,
+                        "charge_finish_time": None,
+                        "required_energy": None
+                    }
 
-            speed_mps = traci.vehicle.getSpeed(vehicle_id)
-            distance_this_step_km = speed_mps / 1000
-            vehicle.consume_energy(distance_this_step_km)
+                vehicle = vehicles[vehicle_id]
+                vehicle.current_edge = current_edge
 
-            if vehicle.soc <= 30 and vehicle_id not in assigned_vehicles:
-                best = select_best_station(
-                    vehicle=vehicle,
-                    stations=stations,
-                    current_time=current_time
-                )
+                state = vehicle_states[vehicle_id]
 
-                if best is None:
-                    records.append({
-                        "time": current_time,
+                if state["status"] == "charging":
+                    if current_time >= state["charge_finish_time"]:
+
+                        vehicle.current_energy += state["required_energy"]
+                        vehicle.current_energy = min(
+                            vehicle.current_energy,
+                            vehicle.battery_capacity
+                        )
+
+                        state["status"] = "done"
+
+                        records.append({
+                            "time": round(current_time, 2),
+                            "vehicle_id": vehicle_id,
+                            "event": "charging_finished",
+                            "station_id": state["selected_station_id"],
+                            "charger_id": state["selected_charger_id"],
+                            "final_soc": round(vehicle.soc, 2),
+                            "current_energy": round(vehicle.current_energy, 2)
+                        })
+
+                        print(
+                            f"[{current_time:.2f} min] {vehicle_id} finished charging | "
+                            f"SoC={vehicle.soc:.2f}%"
+                        )
+
+                    continue
+
+                if state["status"] == "going_to_charge":
+                    selected_station = next(
+                        station for station in stations
+                        if station.station_id == state["selected_station_id"]
+                    )
+
+                    if current_edge == selected_station.edge_id:
+                        state["status"] = "charging"
+
+                        records.append({
+                            "time": round(current_time, 2),
+                            "vehicle_id": vehicle_id,
+                            "event": "arrived_at_station",
+                            "station_id": selected_station.station_id,
+                            "edge_id": current_edge,
+                            "soc": round(vehicle.soc, 2)
+                        })
+
+                        print(
+                            f"[{current_time:.2f} min] {vehicle_id} arrived at "
+                            f"{selected_station.station_id}"
+                        )
+
+                if state["status"] in ["going_to_charge", "driving"]:
+                    speed_mps = traci.vehicle.getSpeed(vehicle_id)
+                    distance_this_step_km = speed_mps / 1000
+                    vehicle.consume_energy(distance_this_step_km)
+                
+                
+
+                if vehicle.soc <= 30 and state["status"] == "driving":
+                    best = select_best_station(
+                        vehicle=vehicle,
+                        stations=stations,
+                        current_time=current_time
+                    )
+
+                    if best is None:
+                        records.append({
+                            "time": current_time,
+                            "vehicle_id": vehicle_id,
+                            "event": "no_reachable_station",
+                            "soc": round(vehicle.soc, 2)
+                        })
+                        continue
+
+                    station = next(
+                        s for s in stations
+                        if s.station_id == best["station_id"]
+                    )
+
+                    session = station.reserve_charger(
+                        option=best,
+                        vehicle_id=vehicle_id
+                    )
+
+                    station_x, station_y = station.get_station_position()
+
+                    try:
+                        traci.vehicle.setRoute(vehicle_id, best["route_edges"])
+                    except traci.TraCIException:
+                        continue
+
+                    state["status"] = "going_to_charge"
+                    state["selected_station_id"] = best["station_id"]
+                    state["selected_charger_id"] = best["charger_id"]
+                    state["charge_start_time"] = session.start_time
+                    state["charge_finish_time"] = session.finish_time
+                    state["required_energy"] = best["required_energy"]
+
+                    selected_charger = next(
+                        charger for charger in station.chargers
+                        if charger.charger_id == best["charger_id"]
+                    )
+
+                    x, y = traci.vehicle.getPosition(vehicle_id)
+                    vehicle_lon, vehicle_lat = NET.convertXY2LonLat(x, y)
+                    station_lon, station_lat = NET.convertXY2LonLat(station_x, station_y)
+
+                    record = {
+                        "time": round(current_time, 2),
                         "vehicle_id": vehicle_id,
-                        "event": "no_reachable_station",
-                        "soc": round(vehicle.soc, 2)
-                    })
-                    continue
+                        "event": "station_selected",
+                        "station_id": best["station_id"],
+                        "charger_id": best["charger_id"],
+                        "station_edge": best["station_edge"],
+                        "soc_now": round(best["soc_now"], 2),
+                        "soc_at_arrival": round(best["soc_at_arrival"], 2),
+                        "distance_km": round(best["distance_km"], 3),
+                        "travel_time_min": round(best["travel_time"], 2),
+                        "waiting_time_min": round(best["waiting_time"], 2),
+                        "charging_time_min": round(best["charging_time"], 2),
+                        "total_time_min": round(best["total_time"], 2),
+                        "required_energy": round(best["required_energy"], 2),
+                        "charge_start_time": round(session.start_time, 2),
+                        "charge_finish_time": round(session.finish_time, 2),
+                        "status": state["status"],
+                        "queue_length": len(selected_charger.sessions),
+                        "current_energy": round(vehicle.current_energy, 2),
+                        "battery_capacity": vehicle.battery_capacity,
+                        "target_soc": vehicle.target_soc_percent,
+                        "queue_length_at_selection": len(selected_charger.sessions),
+                        "current_energy": round(vehicle.current_energy, 2),
+                        "battery_capacity": vehicle.battery_capacity,
+                        "vehicle_x": round(x, 2),
+                        "vehicle_y": round(y, 2),
+                        "station_x": round(station_x, 2),
+                        "station_y": round(station_y, 2),
+                        "vehicle_lon": round(vehicle_lon, 6),
+                        "vehicle_lat": round(vehicle_lat, 6),
+                        "station_lon": round(station_lon, 6),
+                        "station_lat": round(station_lat, 6),
+                    }
 
-                station = next(
-                    s for s in stations
-                    if s.station_id == best["station_id"]
-                )
+                    records.append(record)
 
-                session = station.reserve_charger(
-                    option=best,
-                    vehicle_id=vehicle_id
-                )
+                    print(
+                        f"[{current_time:.0f}s] {vehicle_id} -> "
+                        f"{best['station_id']} | "
+                        f"SoC={vehicle.soc:.1f}% | "
+                        f"Total={best['total_time']:.2f} dk"
+                    )
+    finally:
+        traci.close()
+        save_records(records)
 
-                try:
-                    traci.vehicle.setRoute(vehicle_id, best["route_edges"])
-                except traci.TraCIException:
-                    continue
 
-                assigned_vehicles.add(vehicle_id)
 
-                record = {
-                    "time": round(current_time, 2),
-                    "vehicle_id": vehicle_id,
-                    "event": "station_selected",
-                    "station_id": best["station_id"],
-                    "charger_id": best["charger_id"],
-                    "station_edge": best["station_edge"],
-                    "soc_now": round(best["soc_now"], 2),
-                    "soc_at_arrival": round(best["soc_at_arrival"], 2),
-                    "distance_km": round(best["distance_km"], 3),
-                    "travel_time_min": round(best["travel_time"], 2),
-                    "waiting_time_min": round(best["waiting_time"], 2),
-                    "charging_time_min": round(best["charging_time"], 2),
-                    "total_time_min": round(best["total_time"], 2),
-                    "required_energy": round(best["required_energy"], 2),
-                    "charge_start_time": round(session.start_time, 2),
-                    "charge_finish_time": round(session.finish_time, 2)
-                }
 
-                records.append(record)
-
-                print(
-                    f"[{current_time:.0f}s] {vehicle_id} -> "
-                    f"{best['station_id']} | "
-                    f"SoC={vehicle.soc:.1f}% | "
-                    f"Total={best['total_time']:.2f} dk"
-                )
-
-    traci.close()
-
+def save_records(records):
     if records:
+        print(f"Saving {len(records)} records to CSV...")
         output_file = os.path.join(PROJECT_DIR, "cs_selection_results.csv")
-
         keys = sorted(set().union(*(r.keys() for r in records)))
 
         with open(output_file, "w", newline="", encoding="utf-8") as f:
