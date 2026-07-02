@@ -3,7 +3,9 @@ import sys
 import csv
 import random
 from dataclasses import dataclass, field
+from pandas import options
 import pyproj
+import json                 
 
 SUMO_HOME = r"C:\Program Files (x86)\Eclipse\Sumo"
 PROJECT_DIR = r"C:\Projects\KMT"
@@ -163,33 +165,50 @@ class ChargingStation:
             edges=route.edges
         )
 
-    def estimate_best_option(
+    def estimate_best_option_from_route(
         self,
         vehicle,
+        route_info,
         current_time,
         keep_safety_margin=True
     ):
-        route_info = self.get_route_info(vehicle.current_edge)
-
         if route_info is None:
             return None
 
         distance_km = route_info.distance_km
 
-        if not vehicle.can_reach_station(distance_km, keep_safety_margin):
+        if not vehicle.can_reach_station(
+            distance_km,
+            keep_safety_margin
+        ):
             return None
 
         travel_time = route_info.travel_time_min
         arrival_time = current_time + travel_time
-        required_energy = vehicle.get_required_energy_at_station(distance_km)
+
+        required_energy = vehicle.get_required_energy_at_station(
+            distance_km
+        )
 
         best_option = None
 
         for charger in self.chargers:
             available_time = charger.get_available_time(arrival_time)
-            waiting_time = max(0.0, available_time - arrival_time)
-            charging_time = charger.estimate_charging_time(required_energy)
-            total_time = travel_time + waiting_time + charging_time
+
+            waiting_time = max(
+                0.0,
+                available_time - arrival_time
+            )
+
+            charging_time = charger.estimate_charging_time(
+                required_energy
+            )
+
+            total_time = (
+                travel_time
+                + waiting_time
+                + charging_time
+            )
 
             option = {
                 "station_id": self.station_id,
@@ -204,13 +223,37 @@ class ChargingStation:
                 "total_time": total_time,
                 "required_energy": required_energy,
                 "soc_now": vehicle.soc,
-                "soc_at_arrival": vehicle.expected_soc_after_reaching_station(distance_km)
+                "soc_at_arrival": (
+                    vehicle.expected_soc_after_reaching_station(
+                        distance_km
+                    )
+                ),
+                "queue_length": len(charger.sessions),
+                "charger_power_kw": charger.power_kw,
             }
 
-            if best_option is None or total_time < best_option["total_time"]:
+            if (
+                best_option is None
+                or option["total_time"] < best_option["total_time"]
+            ):
                 best_option = option
 
         return best_option
+
+    def estimate_best_option(
+        self,
+        vehicle,
+        current_time,
+        keep_safety_margin=True
+    ):
+        route_info = self.get_route_info(vehicle.current_edge)
+
+        return self.estimate_best_option_from_route(
+            vehicle=vehicle,
+            route_info=route_info,
+            current_time=current_time,
+            keep_safety_margin=keep_safety_margin
+        )
 
     def reserve_charger(self, option, vehicle_id):
         charger = next(
@@ -233,8 +276,7 @@ class ChargingStation:
 
         return x, y
 
-
-def select_best_station(vehicle, stations, current_time):
+def get_reachable_station_options(vehicle, stations, current_time):
     options = []
 
     for station in stations:
@@ -246,11 +288,7 @@ def select_best_station(vehicle, stations, current_time):
         if option is not None:
             options.append(option)
 
-    if not options:
-        return None
-
-    return min(options, key=lambda x: x["total_time"])
-
+    return options
 
 def create_random_stations(count=5):
     net = sumolib.net.readNet(NET_FILE)
@@ -284,29 +322,220 @@ def create_random_stations(count=5):
 
     return stations
 
+def route_edges_to_latlon(route_edges):
+    coords = []
+
+    for edge_id in route_edges:
+        if edge_id.startswith(":"):
+            continue
+
+        try:
+            edge = NET.getEdge(edge_id)
+        except KeyError:
+            continue
+
+        for x, y in edge.getShape():
+            lon, lat = NET.convertXY2LonLat(x, y)
+
+            point = [round(lat, 6), round(lon, 6)]
+
+            if not coords or coords[-1] != point:
+                coords.append(point)
+
+    return coords
+
+def create_default_stations(seed_demo_queue=False):
+    stations = [
+        ChargingStation(
+            station_id="CS_1",
+            edge_id="97388510#1",
+            chargers=[
+                Charger(
+                    "CS_1_CH_1",
+                    power_kw=50,
+                    efficiency=0.90
+                )
+            ]
+        ),
+        ChargingStation(
+            station_id="CS_2",
+            edge_id="-97226043#0",
+            chargers=[
+                Charger(
+                    "CS_2_CH_1",
+                    power_kw=100,
+                    efficiency=0.90
+                )
+            ]
+        ),
+        ChargingStation(
+            station_id="CS_3",
+            edge_id="174851559#1",
+            chargers=[
+                Charger(
+                    "CS_3_CH_1",
+                    power_kw=150,
+                    efficiency=0.90
+                )
+            ]
+        ),
+    ]
+
+    # Uygulama demosunda bekleme süresi görünmesi için.
+    # Gerçek sürümde bunlar veritabanından gelir.
+    if seed_demo_queue:
+        stations[0].chargers[0].sessions.append(
+            QueueEntry(
+                vehicle_id="demo_vehicle_1",
+                start_time=0,
+                charging_duration=20
+            )
+        )
+
+        stations[1].chargers[0].sessions.append(
+            QueueEntry(
+                vehicle_id="demo_vehicle_2",
+                start_time=0,
+                charging_duration=10
+            )
+        )
+
+    return stations
+
+
+def analyze_interactive_location(
+    lat,
+    lon,
+    battery_capacity,
+    current_soc_percent,
+    consumption_per_km,
+    target_soc_percent,
+    stations,
+    current_time=0.0,
+    min_soc_percent=20.0
+):
+
+    source_edge = find_nearest_passenger_edge(lon, lat)
+
+    if source_edge is None:
+        raise ValueError(
+            "Seçilen konum SUMO yol ağı üzerindeki bir araç yoluna bağlanamadı."
+        )
+
+    current_energy = (
+        battery_capacity
+        * current_soc_percent
+        / 100
+    )
+
+    vehicle = Vehicle(
+        vehicle_id="interactive_user",
+        battery_capacity=battery_capacity,
+        current_energy=current_energy,
+        consumption_per_km=consumption_per_km,
+        current_edge=source_edge.getID(),
+        min_soc_percent=min_soc_percent,
+        target_soc_percent=target_soc_percent
+    )
+
+    options = []
+
+    for station in stations:
+        route_info = get_static_route_info(
+            source_edge.getID(),
+            station.edge_id
+        )
+
+        option = station.estimate_best_option_from_route(
+            vehicle=vehicle,
+            route_info=route_info,
+            current_time=current_time
+        )
+
+        if option is None:
+            continue
+
+        station_x, station_y = station.get_station_position()
+
+        station_lon, station_lat = NET.convertXY2LonLat(
+            station_x,
+            station_y
+        )
+
+        route_coords = [
+            [round(lat, 6), round(lon, 6)]
+        ]
+
+        route_coords.extend(
+            route_edges_to_latlon(option["route_edges"])
+        )
+
+        route_coords.append(
+            [round(station_lat, 6), round(station_lon, 6)]
+        )
+
+        option.update({
+            "vehicle_lat": round(lat, 6),
+            "vehicle_lon": round(lon, 6),
+            "station_lat": round(station_lat, 6),
+            "station_lon": round(station_lon, 6),
+            "route_coords": route_coords,
+            "source_edge": source_edge.getID(),
+        })
+
+        options.append(option)
+
+    if not options:
+        return []
+
+    best_total = min(
+        options,
+        key=lambda item: item["total_time"]
+    )
+
+    best_distance = min(
+        options,
+        key=lambda item: item["distance_km"]
+    )
+
+    best_waiting = min(
+        options,
+        key=lambda item: item["waiting_time"]
+    )
+
+    best_charging = min(
+        options,
+        key=lambda item: item["charging_time"]
+    )
+
+    for option in options:
+        option["is_best_total_time"] = (
+            option["charger_id"] == best_total["charger_id"]
+        )
+
+        option["is_best_distance"] = (
+            option["charger_id"] == best_distance["charger_id"]
+        )
+
+        option["is_best_waiting"] = (
+            option["charger_id"] == best_waiting["charger_id"]
+        )
+
+        option["is_best_charging"] = (
+            option["charger_id"] == best_charging["charger_id"]
+        )
+
+    return sorted(
+        options,
+        key=lambda item: item["total_time"]
+    )
 
 def main():
     try:
         os.chdir(PROJECT_DIR)
 
         #stations = create_random_stations(count=5)
-        stations = [
-            ChargingStation(
-                station_id="CS_1",
-                edge_id="97388510#1",
-                chargers=[Charger("CS_1_CH_1", power_kw=50, efficiency=0.90)]
-            ),
-            ChargingStation(
-                station_id="CS_2",
-                edge_id="-97226043#0",
-                chargers=[Charger("CS_2_CH_1", power_kw=100, efficiency=0.90)]
-            ),
-            ChargingStation(
-                station_id="CS_3",
-                edge_id="174851559#1",
-                chargers=[Charger("CS_3_CH_1", power_kw=150, efficiency=0.90)]
-            ),
-        ]
+        stations = create_default_stations()
 
         print("Charging stations:")
         for station in stations:
@@ -423,20 +652,69 @@ def main():
                 
 
                 if vehicle.soc <= 30 and state["status"] == "driving":
-                    best = select_best_station(
+                    options = get_reachable_station_options(
                         vehicle=vehicle,
                         stations=stations,
                         current_time=current_time
                     )
+                    
+                    best_total = min(options, key=lambda x: x["total_time"])
+                    best_distance = min(options, key=lambda x: x["distance_km"])
+                    best_waiting = min(options, key=lambda x: x["waiting_time"])
+                    best_charging = min(options, key=lambda x: x["charging_time"])
 
-                    if best is None:
+                    x, y = traci.vehicle.getPosition(vehicle_id)
+                    vehicle_lon, vehicle_lat = NET.convertXY2LonLat(x, y)
+
+
+                    for option in options:
+                        station = next(
+                            s for s in stations
+                            if s.station_id == option["station_id"]
+                        )
+
+                        station_x, station_y = station.get_station_position()
+                        station_lon, station_lat = NET.convertXY2LonLat(station_x, station_y)
+
+                        route_coords = [
+                            [round(vehicle_lat, 6), round(vehicle_lon, 6)]
+                        ]
+
+                        route_coords.extend(
+                            route_edges_to_latlon(option["route_edges"])
+                        )
+
+                        route_coords.append(
+                            [round(station_lat, 6), round(station_lon, 6)]
+                        )
+
                         records.append({
-                            "time": current_time,
+                            "time": round(current_time, 2),
                             "vehicle_id": vehicle_id,
-                            "event": "no_reachable_station",
-                            "soc": round(vehicle.soc, 2)
+                            "event": "station_option_calculated",
+                            "station_id": option["station_id"],
+                            "charger_id": option["charger_id"],
+                            "soc_now": round(option["soc_now"], 2),
+                            "soc_at_arrival": round(option["soc_at_arrival"], 2),
+                            "distance_km": round(option["distance_km"], 3),
+                            "travel_time_min": round(option["travel_time"], 2),
+                            "waiting_time_min": round(option["waiting_time"], 2),
+                            "charging_time_min": round(option["charging_time"], 2),
+                            "total_time_min": round(option["total_time"], 2),
+                            "required_energy": round(option["required_energy"], 2),
+                            "is_best_total_time": option["station_id"] == best_total["station_id"],
+                            "is_best_distance": option["station_id"] == best_distance["station_id"],
+                            "is_best_waiting": option["station_id"] == best_waiting["station_id"],
+                            "is_best_charging": option["station_id"] == best_charging["station_id"],
+                            "vehicle_lat": round(vehicle_lat, 6),
+                            "vehicle_lon": round(vehicle_lon, 6),
+                            "station_lat": round(station_lat, 6),
+                            "station_lon": round(station_lon, 6),
+                            "route_coords": json.dumps(route_coords),
+                            "route_edges": json.dumps(list(option["route_edges"])),
                         })
-                        continue
+                    
+                    best = best_total
 
                     station = next(
                         s for s in stations
@@ -536,6 +814,71 @@ def save_records(records):
     else:
         print("No records generated.")
 
+
+def find_nearest_passenger_edge(lon, lat):
+    x, y = NET.convertLonLat2XY(lon, lat)
+
+    for radius in [25, 50, 100, 250, 500, 1000]:
+        candidates = [
+            (edge, distance)
+            for edge, distance in NET.getNeighboringEdges(x, y, radius)
+            if not edge.getID().startswith(":") and edge.allows("passenger")
+        ]
+
+        if candidates:
+            closest_edge, _ = min(candidates, key=lambda item: item[1])
+            return closest_edge
+
+    return None
+
+def get_static_route_info(from_edge_id, to_edge_id):
+    try:
+        from_edge = NET.getEdge(from_edge_id)
+        to_edge = NET.getEdge(to_edge_id)
+    except KeyError:
+        return None
+
+    route_edges, travel_time_sec = NET.getFastestPath(
+        from_edge,
+        to_edge,
+        vClass="passenger"
+    )
+
+    if not route_edges:
+        return None
+
+    distance_km = sum(
+        edge.getLength()
+        for edge in route_edges
+    ) / 1000
+
+    return RouteInfo(
+        distance_km=distance_km,
+        travel_time_min=travel_time_sec / 60,
+        edges=tuple(edge.getID() for edge in route_edges)
+    )
+
+def route_edges_to_latlon(route_edges):
+    coords = []
+
+    for edge_id in route_edges:
+        if edge_id.startswith(":"):
+            continue
+
+        try:
+            edge = NET.getEdge(edge_id)
+        except KeyError:
+            continue
+
+        for x, y in edge.getShape():
+            lon, lat = NET.convertXY2LonLat(x, y)
+
+            point = [round(lat, 6), round(lon, 6)]
+
+            if not coords or coords[-1] != point:
+                coords.append(point)
+
+    return coords
 
 if __name__ == "__main__":
     main()
