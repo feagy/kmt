@@ -32,6 +32,13 @@ class Vehicle:
     min_soc_percent: float = 20.0
     target_soc_percent: float = 80.0
 
+    max_charge_power_kw: float = 150.0
+    charging_protocol: str = "CP-CV"
+    u_low_v: float = 320.0
+    u_high_v: float = 400.0
+    taper_start_soc_percent: float = 80.0
+    terminal_soc_percent: float = 99.0
+
     @property
     def soc(self):
         return self.current_energy / self.battery_capacity * 100
@@ -42,7 +49,12 @@ class Vehicle:
 
     @property
     def q_target(self):
-        return self.battery_capacity * self.target_soc_percent / 100
+        effective_target_soc = min(
+            self.target_soc_percent,
+            self.terminal_soc_percent
+        )
+
+        return self.battery_capacity * effective_target_soc / 100
 
     def consume_energy(self, distance_km):
         self.current_energy -= distance_km * self.consumption_per_km
@@ -108,6 +120,141 @@ class Charger:
         latest_finish = max(session.finish_time for session in self.sessions)
         return max(arrival_time, latest_finish)
 
+    def get_effective_max_power_kw(self, vehicle):
+        return min(
+            self.power_kw,
+            vehicle.max_charge_power_kw
+        )
+    
+    def get_instantaneous_power_kw(self, vehicle, soc_percent):
+        soc = max(0.0, min(soc_percent, 100.0)) / 100
+
+        taper_soc = vehicle.taper_start_soc_percent / 100
+        p_max_kw = self.get_effective_max_power_kw(vehicle)
+
+        u_low = vehicle.u_low_v
+        u_high = vehicle.u_high_v
+
+        if p_max_kw <= 0 or u_high <= 0:
+            return 0.0
+
+        i_max_a = (p_max_kw * 1000) / u_high
+
+        if soc < taper_soc:
+            current_a = i_max_a
+        else:
+            taper_ratio = (1 - soc) / (1 - taper_soc)
+            current_a = max(0.0, taper_ratio * i_max_a)
+
+        if soc < taper_soc:
+            voltage_v = u_low + (
+                (soc / taper_soc) * (u_high - u_low)
+            )
+        else:
+            voltage_v = u_high
+
+        protocol = vehicle.charging_protocol.upper()
+
+        if protocol == "CC-CV":
+            power_kw = (voltage_v * current_a) / 1000
+
+        elif protocol == "CP-CV":
+            if soc < taper_soc:
+                power_kw = p_max_kw
+            else:
+                power_kw = (voltage_v * current_a) / 1000
+
+        else:
+            raise ValueError(
+                "charging_protocol yalnızca 'CC-CV' veya 'CP-CV' olabilir."
+            )
+
+        return min(power_kw, p_max_kw)
+
+    def estimate_charging_time(
+        self,
+        vehicle,
+        soc_at_arrival_percent,
+        step_minutes=0.25
+    ):
+        """
+        Denklem 1.23'e göre zaman adımlı enerji aktarımı yapar.
+        0.25 dk = 15 saniyelik adım kullanılır.
+        """
+        start_soc = max(0.0, soc_at_arrival_percent)
+
+        target_soc = min(
+            vehicle.target_soc_percent,
+            vehicle.terminal_soc_percent
+        )
+
+        if start_soc >= target_soc:
+            return 0.0
+
+        current_energy = (
+            vehicle.battery_capacity * start_soc / 100
+        )
+
+        target_energy = (
+            vehicle.battery_capacity * target_soc / 100
+        )
+
+        elapsed_minutes = 0.0
+
+        while current_energy < target_energy:
+            current_soc = (
+                current_energy / vehicle.battery_capacity
+            ) * 100
+
+            power_kw = self.get_instantaneous_power_kw(
+                vehicle,
+                current_soc
+            )
+
+            battery_power_kw = power_kw * self.efficiency
+
+            if battery_power_kw <= 0:
+                raise ValueError(
+                    "Şarj gücü sıfırlandı; hedef SoC hesaplanamıyor."
+                )
+
+            energy_this_step = (
+                battery_power_kw * step_minutes / 60
+            )
+
+            remaining_energy = target_energy - current_energy
+
+            if energy_this_step >= remaining_energy:
+                elapsed_minutes += (
+                    remaining_energy / battery_power_kw
+                ) * 60
+                break
+
+            current_energy += energy_this_step
+            elapsed_minutes += step_minutes
+
+        return elapsed_minutes
+
+    def reserve(
+        self,
+        vehicle_id,
+        arrival_time,
+        charging_duration
+    ):
+        available_time = self.get_available_time(arrival_time)
+
+        start_time = max(arrival_time, available_time)
+
+        entry = QueueEntry(
+            vehicle_id=vehicle_id,
+            start_time=start_time,
+            charging_duration=charging_duration
+        )
+
+        self.sessions.append(entry)
+        return entry
+
+    """
     def estimate_charging_time(self, required_energy):
         if required_energy <= 0:
             return 0.0
@@ -127,7 +274,7 @@ class Charger:
 
         self.sessions.append(entry)
         return entry
-
+    """
     def clean_finished_sessions(self, current_time):
         self.sessions = [
             session for session in self.sessions
@@ -200,8 +347,13 @@ class ChargingStation:
                 available_time - arrival_time
             )
 
+            soc_at_arrival = vehicle.expected_soc_after_reaching_station(
+                distance_km
+            )
+
             charging_time = charger.estimate_charging_time(
-                required_energy
+                vehicle=vehicle,
+                soc_at_arrival_percent=soc_at_arrival
             )
 
             total_time = (
@@ -223,11 +375,7 @@ class ChargingStation:
                 "total_time": total_time,
                 "required_energy": required_energy,
                 "soc_now": vehicle.soc,
-                "soc_at_arrival": (
-                    vehicle.expected_soc_after_reaching_station(
-                        distance_km
-                    )
-                ),
+                "soc_at_arrival": soc_at_arrival,
                 "queue_length": len(charger.sessions),
                 "charger_power_kw": charger.power_kw,
             }
@@ -264,7 +412,7 @@ class ChargingStation:
         return charger.reserve(
             vehicle_id=vehicle_id,
             arrival_time=option["arrival_time"],
-            required_energy=option["required_energy"]
+            charging_duration=option["charging_time"]
         )
     
     def get_station_position(self):
@@ -381,8 +529,6 @@ def create_default_stations(seed_demo_queue=False):
         ),
     ]
 
-    # Uygulama demosunda bekleme süresi görünmesi için.
-    # Gerçek sürümde bunlar veritabanından gelir.
     if seed_demo_queue:
         stations[0].chargers[0].sessions.append(
             QueueEntry(
@@ -486,7 +632,11 @@ def analyze_interactive_location(
         options.append(option)
 
     if not options:
-        return []
+        raise ValueError(
+            "Seçilen konumdan menzil içinde ve SUMO yol ağı üzerinden "
+            "erişilebilen istasyon bulunamadı. "
+            "Haritada simülasyon ağının kapsadığı bölge içinde bir nokta seçin."
+        )
 
     best_total = min(
         options,
@@ -657,6 +807,15 @@ def main():
                         stations=stations,
                         current_time=current_time
                     )
+
+                    if not options:
+                        records.append({
+                            "time": round(current_time, 2),
+                            "vehicle_id": vehicle_id,
+                            "event": "no_reachable_station",
+                            "soc": round(vehicle.soc, 2)
+                        })
+                        continue
                     
                     best_total = min(options, key=lambda x: x["total_time"])
                     best_distance = min(options, key=lambda x: x["distance_km"])

@@ -13,6 +13,7 @@ st.set_page_config(page_title="Elektrikli Araç Şarj İstasyonu Seçimi", layou
 
 st.title("Elektrikli Araç Şarj İstasyonu Seçimi")
 
+
 if "interactive_stations" not in st.session_state:
     st.session_state["interactive_stations"] = (
         create_default_stations()
@@ -20,6 +21,9 @@ if "interactive_stations" not in st.session_state:
 
 if "live_options" not in st.session_state:
     st.session_state["live_options"] = []
+
+if "map_version" not in st.session_state:
+    st.session_state["map_version"] = 0
 
 CSV_PATH = "cs_selection_results.csv"
 
@@ -168,7 +172,6 @@ def build_analysis_map(user_location, options):
         control_scale=True
     )
 
-    # Kullanıcının seçtiği başlangıç noktası
     folium.Marker(
         location=[lat, lon],
         tooltip="Seçilen araç konumu",
@@ -213,7 +216,6 @@ def build_analysis_map(user_location, options):
         Varış SoC: %{option["soc_at_arrival"]:.1f}
         """
 
-        # Her istasyon + rotası aynı layer içinde olur
         station_layer = folium.FeatureGroup(
             name=f'{option["station_id"]} — {style["label"]}',
             show=True
@@ -428,7 +430,6 @@ with tab_analysis:
             round(location["lon"], 6),
         )
 
-        # Sadece mevcut araç/SoC/konum için yapılan analizi göster.
         if (
             st.session_state.get("analysis_signature") == current_signature
         ):
@@ -445,32 +446,36 @@ with tab_analysis:
             location_map,
             width=700,
             height=430,
-            key="location_picker"
+            key=f"location_picker_{st.session_state['map_version']}"
         )
 
         clicked_location = map_click.get("last_clicked")
-        clicked_object = map_click.get("last_object_clicked")
 
-        # Boş haritaya tıklanırsa araç konumunu güncelle.
-        # Marker/rota tıklanınca kullanıcı konumu değişmesin.
-        if clicked_location and not clicked_object:
-            new_lat = round(clicked_location["lat"], 6)
-            new_lon = round(clicked_location["lng"], 6)
+        if clicked_location:
+            new_location = {
+                "lat": round(clicked_location["lat"], 6),
+                "lon": round(clicked_location["lng"], 6),
+            }
 
-            old_lat = st.session_state["user_location"]["lat"]
-            old_lon = st.session_state["user_location"]["lon"]
+            old_location = st.session_state["user_location"]
 
-            if (new_lat, new_lon) != (old_lat, old_lon):
-                st.session_state["user_location"] = {
-                    "lat": new_lat,
-                    "lon": new_lon,
-                }
+            if new_location != old_location:
+                st.session_state["user_location"] = new_location
 
-                # Yeni konumda eski analiz sonucu geçersiz olur.
+                # Yeni konumda eski analiz/rotalar geçersiz.
                 st.session_state["live_options"] = []
                 st.session_state.pop("analysis_signature", None)
 
+                st.session_state["location_status"] = (
+                    f"Yeni konum seçildi: "
+                    f"{new_location['lat']:.5f}, {new_location['lon']:.5f}"
+                )
+
+                # Yeni key ile haritayı ve araç markerını yeniden oluştur.
+                st.session_state["map_version"] += 1
                 st.rerun()
+
+
 
         st.caption(
             f"Konum: {location['lat']:.5f}, {location['lon']:.5f}"
@@ -487,12 +492,14 @@ with tab_analysis:
     if st.button(
         "Analizi Başlat",
         type="primary",
-        use_container_width=True
+        width="stretch"
     ):
         try:
+            selected_location = st.session_state["user_location"]
+
             live_options = analyze_interactive_location(
-                lat=st.session_state["user_location"]["lat"],
-                lon=st.session_state["user_location"]["lon"],
+                lat=selected_location["lat"],
+                lon=selected_location["lon"],
                 battery_capacity=profile["battery_kwh"],
                 current_soc_percent=current_soc,
                 consumption_per_km=profile["consumption_kwh_km"],
@@ -503,14 +510,34 @@ with tab_analysis:
             )
 
             st.session_state["live_options"] = live_options
-            st.session_state["analysis_signature"] = current_signature
+
+            # İmza, analizin gerçekten kullandığı güncel konumdan oluşsun.
+            st.session_state["analysis_signature"] = (
+                selected_model,
+                current_soc,
+                target_soc,
+                round(selected_location["lat"], 6),
+                round(selected_location["lon"], 6),
+            )
+
+            st.session_state["analysis_status"] = (
+                f"{len(live_options)} erişilebilir istasyon için analiz tamamlandı."
+            )
 
             st.rerun()
 
         except ValueError as error:
+            st.session_state["live_options"] = []
+            st.session_state.pop("analysis_signature", None)
             st.error(str(error))
 
-
+    current_signature = (
+        selected_model,
+        current_soc,
+        target_soc,
+        round(st.session_state["user_location"]["lat"], 6),
+        round(st.session_state["user_location"]["lon"], 6),
+    )
     active_live_options = []
 
     if st.session_state.get("analysis_signature") == current_signature:
@@ -876,7 +903,6 @@ with tab_results:
                 ["Strateji", selected_metric_column]
             ].copy()
 
-            # Altair için sade ve garanti isimler
             chart_df = chart_df.rename(
                 columns={
                     "Strateji": "strategy",
